@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# log rotate
+docker exec -it webapp-nginx-1 /bin/bash /var/log/nginx/nginx-logrotate.sh
+
+# benchmark
 readonly GAS_POST_URL="https://script.google.com/macros/s/AKfycbzAtaKnPpjujtHZYBpKkvgmd72EtHHceC9EvlZWePScjNEQgQB9w64OuifC8T69YAc/exec"
 readonly TARGET_URL="http://localhost"
 

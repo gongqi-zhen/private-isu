@@ -18,5 +18,6 @@ portal/tmp
 .vagrant
 
 # Ignore test logs
-webapp/logs/*
+webapp/logs/nginx/access.log*
+webapp/logs/nginx/error.log*
 tatsujin-web-performance/
