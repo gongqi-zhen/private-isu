@@ -16,3 +16,7 @@ portal/tmp
 !/portal/log/.keep
 /portal/tmp
 .vagrant
+
+# Ignore test logs
+webapp/logs/*
+tatsujin-web-performance/
