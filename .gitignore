@@ -20,4 +20,5 @@ portal/tmp
 # Ignore test logs
 webapp/logs/nginx/access.log*
 webapp/logs/nginx/error.log*
+webapp/logs/mysql/*
 tatsujin-web-performance/
