@@ -662,7 +662,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filename := fmt.Sprintf("../image/%d.%s", pid, getExtension(mime))
+	filename := fmt.Sprintf("/home/public/image/%d.%s", pid, getExtension(mime))
 	err = os.WriteFile(filename, filedata, 0644)
 	if err != nil {
 		log.Print("Could not write file: ", err)
