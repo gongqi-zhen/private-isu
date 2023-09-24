@@ -22,3 +22,6 @@ webapp/logs/nginx/access.log*
 webapp/logs/nginx/error.log*
 webapp/logs/mysql/*
 tatsujin-web-performance/
+
+# DB内のimageを静的ファイルとしてもつ
+webapp/golang/image
