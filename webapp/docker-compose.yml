@@ -12,8 +12,7 @@ services:
 
   app:
     # Go実装の場合は golang/ PHP実装の場合は php/
-    #build: ruby/
-    build: golang/
+    build: ruby/
     environment:
       ISUCONP_DB_HOST: mysql
       ISUCONP_DB_PORT: 3306
@@ -30,7 +29,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '2'
+          cpus: '1'
           memory: 1g
 
   mysql:
