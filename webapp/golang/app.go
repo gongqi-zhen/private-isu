@@ -2,6 +2,7 @@ package main
 
 import (
 	crand "crypto/rand"
+	"database/sql"
 	"fmt"
 	"html/template"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -51,10 +53,29 @@ type Post struct {
 	Body         string    `db:"body"`
 	Mime         string    `db:"mime"`
 	CreatedAt    time.Time `db:"created_at"`
-	CommentCount int
+	CommentCount int       `db:"comment_count"`
+	RN           int       `db:"rn"`
+	Comment      NullComment
 	Comments     []Comment
 	User         User
 	CSRFToken    string
+}
+
+type NullComment struct {
+	ID        sql.NullInt64  `db:"id"`
+	PostID    sql.NullInt64  `db:"post_id"`
+	UserID    sql.NullInt64  `db:"user_id"`
+	Comment   sql.NullString `db:"comment"`
+	CreatedAt sql.NullTime   `db:"created_at"`
+	User      NullUser
+}
+
+type NullUser struct {
+	ID          sql.NullInt64  `db:"id"`
+	AccountName sql.NullString `db:"account_name"`
+	Authority   sql.NullInt64  `db:"authority"`
+	DelFlg      sql.NullInt64  `db:"del_flg"`
+	CreatedAt   sql.NullTime   `db:"created_at"`
 }
 
 type Comment struct {
@@ -202,42 +223,42 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
-func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	var posts []Post
+func makePosts(results []Post, csrfToken string) ([]Post, error) {
+	postMap := make(map[int]Post, postsPerPage)
 
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
-			return nil, err
+		if _, ok := postMap[p.ID]; !ok {
+			postMap[p.ID] = p
 		}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
+		if p.Comment.ID.Valid {
+			p.Comments = append(p.Comments, Comment{
+				ID:        int(p.Comment.ID.Int64),
+				PostID:    int(p.Comment.PostID.Int64),
+				UserID:    int(p.Comment.UserID.Int64),
+				Comment:   p.Comment.Comment.String,
+				CreatedAt: p.Comment.CreatedAt.Time,
+				User: User{
+					ID:          int(p.Comment.User.ID.Int64),
+					AccountName: p.Comment.User.AccountName.String,
+					Authority:   int(p.Comment.User.Authority.Int64),
+					DelFlg:      int(p.Comment.User.DelFlg.Int64),
+					CreatedAt:   p.Comment.User.CreatedAt.Time,
+				},
+			})
 		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
+	}
 
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
-		}
-
-		p.Comments = comments
-
+	posts := make([]Post, 0, len(postMap))
+	for _, p := range postMap {
 		p.CSRFToken = csrfToken
 		posts = append(posts, p)
 	}
+
+	slices.SortFunc(posts, func(i Post, j Post) int {
+		// 降順
+		return int(j.CreatedAt.UnixNano() - i.CreatedAt.UnixNano())
+	})
 
 	return posts, nil
 }
@@ -407,16 +428,26 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.Select(&results, "SELECT "+
+	err := db.Select(&results, "WITH pu AS ( SELECT "+
 		"`posts`.`id`, `posts`.`user_id`, `posts`.`body`, `posts`.`mime`, `posts`.`created_at`, "+
 		"`users`.`id` AS `user.id`, `users`.`account_name` AS `user.account_name`, `users`.`authority` AS `user.authority`, `users`.`del_flg` AS `user.del_flg`, `users`.`created_at` AS `user.created_at` "+
-		"FROM `posts` LEFT JOIN `users` ON `users`.`id` = `posts`.`user_id` WHERE `users`.`del_flg` = 0 ORDER BY `posts`.`created_at` DESC LIMIT ?", postsPerPage)
+		"FROM `posts` LEFT JOIN `users` ON `users`.`id` = `posts`.`user_id` WHERE `users`.`del_flg` = 0 ORDER BY `posts`.`created_at` DESC LIMIT ? ), "+
+		"pc AS ( SELECT "+
+		"pu.*, "+
+		"`comments`.`id` AS `comment.id`, `comments`.`user_id` AS `comment.user_id`, `comments`.`comment` AS `comment.comment`, `comments`.`created_at` AS `comment.created_at`, "+
+		"`users`.`id` AS `comment.user.id`, `users`.`account_name` AS `comment.user.account_name`, `users`.`authority` AS `comment.user.authority`, `users`.`del_flg` AS `comment.user.del_flg`, `users`.`created_at` AS `comment.user.created_at`, "+
+		"ROW_NUMBER() OVER (PARTITION BY pu.id ORDER BY comments.created_at) AS rn, COUNT(*) OVER (PARTITION BY pu.id) AS comment_count "+
+		"FROM pu "+
+		"LEFT JOIN `comments` ON `comments`.`post_id` = `pu`.`id` "+
+		"LEFT JOIN `users` ON `users`.`id` = `comments`.`user_id` "+
+		"ORDER BY `comments`.`created_at` ) "+
+		"SELECT * FROM pc WHERE (rn <= 3 OR rn IS NULL)", postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
+	posts, err := makePosts(results, getCSRFToken(r))
 	if err != nil {
 		log.Print(err)
 		return
@@ -456,16 +487,27 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.Select(&results, "SELECT "+
+	err = db.Select(&results, "WITH pu AS ( SELECT "+
 		"`posts`.`id`, `posts`.`user_id`, `posts`.`body`, `posts`.`mime`, `posts`.`created_at`, "+
 		"`users`.`id` AS `user.id`, `users`.`account_name` AS `user.account_name`, `users`.`authority` AS `user.authority`, `users`.`del_flg` AS `user.del_flg`, `users`.`created_at` AS `user.created_at` "+
-		"FROM `posts` LEFT JOIN `users` ON `users`.`id` = `posts`.`user_id` WHERE `users`.`del_flg` = 0 AND `posts`.`user_id` = ? ORDER BY `posts`.`created_at` DESC LIMIT ?", user.ID, postsPerPage)
+		"FROM `posts` LEFT JOIN `users` ON `users`.`id` = `posts`.`user_id` WHERE `users`.`del_flg` = 0 AND `posts`.`user_id` = ? ORDER BY `posts`.`created_at` DESC LIMIT ? ), "+
+		"pc AS ( SELECT "+
+		"pu.*, "+
+		"`comments`.`id` AS `comment.id`, `comments`.`user_id` AS `comment.user_id`, `comments`.`comment` AS `comment.comment`, `comments`.`created_at` AS `comment.created_at`, "+
+		"`users`.`id` AS `comment.user.id`, `users`.`account_name` AS `comment.user.account_name`, `users`.`authority` AS `comment.user.authority`, `users`.`del_flg` AS `comment.user.del_flg`, `users`.`created_at` AS `comment.user.created_at`, "+
+		"ROW_NUMBER() OVER (PARTITION BY pu.id ORDER BY comments.created_at) AS rn, COUNT(*) OVER (PARTITION BY pu.id) AS comment_count "+
+		"FROM pu "+
+		"LEFT JOIN `comments` ON `comments`.`post_id` = `pu`.`id` "+
+		"LEFT JOIN `users` ON `users`.`id` = `comments`.`user_id` "+
+		"ORDER BY `comments`.`created_at` ) "+
+		"SELECT * FROM pc WHERE (rn <= 3 OR rn IS NULL)",
+		user.ID, postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
+	posts, err := makePosts(results, getCSRFToken(r))
 	if err != nil {
 		log.Print(err)
 		return
@@ -547,16 +589,27 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT "+
+	err = db.Select(&results, "WITH pu AS ( SELECT "+
 		"`posts`.`id`, `posts`.`user_id`, `posts`.`body`, `posts`.`mime`, `posts`.`created_at`, "+
 		"`users`.`id` AS `user.id`, `users`.`account_name` AS `user.account_name`, `users`.`authority` AS `user.authority`, `users`.`del_flg` AS `user.del_flg`, `users`.`created_at` AS `user.created_at` "+
-		"FROM `posts` LEFT JOIN `users` ON `users`.`id` = `posts`.`user_id` WHERE `users`.`del_flg` = 0 AND `posts`.`created_at` <= ? ORDER BY `posts`.`created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsPerPage)
+		"FROM `posts` LEFT JOIN `users` ON `users`.`id` = `posts`.`user_id` WHERE `users`.`del_flg` = 0 AND `posts`.`created_at` <= ? ORDER BY `posts`.`created_at` DESC LIMIT ? ), "+
+		"pc AS ( SELECT "+
+		"pu.*, "+
+		"`comments`.`id` AS `comment.id`, `comments`.`user_id` AS `comment.user_id`, `comments`.`comment` AS `comment.comment`, `comments`.`created_at` AS `comment.created_at`, "+
+		"`users`.`id` AS `comment.user.id`, `users`.`account_name` AS `comment.user.account_name`, `users`.`authority` AS `comment.user.authority`, `users`.`del_flg` AS `comment.user.del_flg`, `users`.`created_at` AS `comment.user.created_at`, "+
+		"ROW_NUMBER() OVER (PARTITION BY pu.id ORDER BY comments.created_at) AS rn, COUNT(*) OVER (PARTITION BY pu.id) AS comment_count "+
+		"FROM pu "+
+		"LEFT JOIN `comments` ON `comments`.`post_id` = `pu`.`id` "+
+		"LEFT JOIN `users` ON `users`.`id` = `comments`.`user_id` "+
+		"ORDER BY `comments`.`created_at` ) "+
+		"SELECT * FROM pc WHERE (rn <= 3 OR rn IS NULL)",
+		t.Format(ISO8601Format), postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
+	posts, err := makePosts(results, getCSRFToken(r))
 	if err != nil {
 		log.Print(err)
 		return
@@ -586,16 +639,27 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT "+
+	err = db.Select(&results, "WITH pu AS ( SELECT "+
 		"`posts`.`id`, `posts`.`user_id`, `posts`.`body`, `posts`.`mime`, `posts`.`created_at`, "+
 		"`users`.`id` AS `user.id`, `users`.`account_name` AS `user.account_name`, `users`.`authority` AS `user.authority`, `users`.`del_flg` AS `user.del_flg`, `users`.`created_at` AS `user.created_at` "+
-		"FROM `posts` LEFT JOIN `users` ON `users`.`id` = `posts`.`user_id` WHERE `users`.`del_flg` = 0 AND `posts`.`id` = ? LIMIT ?", pid, postsPerPage)
+		"FROM `posts` LEFT JOIN `users` ON `users`.`id` = `posts`.`user_id` WHERE `users`.`del_flg` = 0 AND `posts`.`id` = ? LIMIT ? ), "+
+		"pc AS ( SELECT "+
+		"pu.*, "+
+		"`comments`.`id` AS `comment.id`, `comments`.`user_id` AS `comment.user_id`, `comments`.`comment` AS `comment.comment`, `comments`.`created_at` AS `comment.created_at`, "+
+		"`users`.`id` AS `comment.user.id`, `users`.`account_name` AS `comment.user.account_name`, `users`.`authority` AS `comment.user.authority`, `users`.`del_flg` AS `comment.user.del_flg`, `users`.`created_at` AS `comment.user.created_at`, "+
+		"ROW_NUMBER() OVER (PARTITION BY pu.id ORDER BY comments.created_at) AS rn, COUNT(*) OVER (PARTITION BY pu.id) AS comment_count "+
+		"FROM pu "+
+		"LEFT JOIN `comments` ON `comments`.`post_id` = `pu`.`id` "+
+		"LEFT JOIN `users` ON `users`.`id` = `comments`.`user_id` "+
+		"ORDER BY `comments`.`created_at` ) "+
+		"SELECT * FROM pc",
+		pid, postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), true)
+	posts, err := makePosts(results, getCSRFToken(r))
 	if err != nil {
 		log.Print(err)
 		return
