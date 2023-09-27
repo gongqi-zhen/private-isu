@@ -19,7 +19,7 @@
 
     {{ range .Comments }}
     <div class="isu-comment">
-      <a href="/@{{.User.AccountName}}" class="isu-comment-account-name">{{.User.AccountName}}</a>
+      <a href="/@{{.AuthorName}}" class="isu-comment-account-name">{{.AuthorName}}</a>
       <span class="isu-comment-text">{{.Comment}}</span>
     </div>
     {{ end }}
