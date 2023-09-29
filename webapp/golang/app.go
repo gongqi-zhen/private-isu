@@ -17,7 +17,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	"github.com/bradfitz/gomemcache/memcache"
 	gsm "github.com/bradleypeabody/gorilla-sessions-memcache"
@@ -32,6 +35,7 @@ import (
 var (
 	db    *sqlx.DB
 	store *gsm.MemcacheStore
+	sf    = singleflight.Group{}
 )
 
 const (
@@ -431,34 +435,74 @@ var (
 	))
 )
 
+var (
+	indexPosts      = []Post{}
+	indexPostsMutex = sync.RWMutex{}
+	lastUpdated     = time.Now()
+	lastTriggered   = time.Now()
+)
+
+func updateIndexPosts() ([]Post, error) {
+	indexPostsMutex.RLock()
+	if lastUpdated.After(lastTriggered) {
+		defer indexPostsMutex.RUnlock()
+		return indexPosts, nil
+	}
+	indexPostsMutex.RUnlock()
+
+	_, err, _ := sf.Do("indexPosts", func() (interface{}, error) {
+		indexPostsMutex.Lock()
+		lastTriggered = time.Now()
+		defer indexPostsMutex.Unlock()
+		results := []Post{}
+		err := db.Select(&results, "WITH pu AS ( SELECT "+
+			"`posts`.`id`, `posts`.`user_id`, `posts`.`body`, `posts`.`mime`, `posts`.`created_at`, "+
+			"`users`.`id` AS `user.id`, `users`.`account_name` AS `user.account_name`, `users`.`authority` AS `user.authority`, `users`.`del_flg` AS `user.del_flg`, `users`.`created_at` AS `user.created_at` "+
+			"FROM `posts` LEFT JOIN `users` ON `users`.`id` = `posts`.`user_id` WHERE `users`.`del_flg` = 0 ORDER BY `posts`.`created_at` DESC LIMIT ? ), "+
+			"pc AS ( SELECT "+
+			"pu.*, "+
+			"`comments`.`id` AS `comment.id`, `comments`.`user_id` AS `comment.user_id`, `comments`.`comment` AS `comment.comment`, `comments`.`created_at` AS `comment.created_at`, "+
+			"`users`.`id` AS `comment.user.id`, `users`.`account_name` AS `comment.user.account_name`, `users`.`authority` AS `comment.user.authority`, `users`.`del_flg` AS `comment.user.del_flg`, `users`.`created_at` AS `comment.user.created_at`, "+
+			"ROW_NUMBER() OVER (PARTITION BY pu.id ORDER BY comments.created_at) AS rn, COUNT(*) OVER (PARTITION BY pu.id) AS comment_count "+
+			"FROM pu "+
+			"LEFT JOIN `comments` ON `comments`.`post_id` = `pu`.`id` "+
+			"LEFT JOIN `users` ON `users`.`id` = `comments`.`user_id` "+
+			"ORDER BY `comments`.`created_at` ) "+
+			"SELECT * FROM pc WHERE (rn <= 3 OR rn IS NULL)", postsPerPage)
+		if err != nil {
+			log.Print(err)
+			return nil, err
+		}
+		posts, err := makePosts(results, "")
+		if err != nil {
+			return nil, err
+		}
+
+		indexPosts = posts
+		lastUpdated = time.Now()
+		return nil, nil
+	})
+
+	indexPostsMutex.RLock()
+	defer indexPostsMutex.RUnlock()
+
+	if err != nil {
+		return nil, err
+	}
+	return indexPosts, nil
+}
+
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
-	results := []Post{}
-
-	err := db.Select(&results, "WITH pu AS ( SELECT "+
-		"`posts`.`id`, `posts`.`user_id`, `posts`.`body`, `posts`.`mime`, `posts`.`created_at`, "+
-		"`users`.`id` AS `user.id`, `users`.`account_name` AS `user.account_name`, `users`.`authority` AS `user.authority`, `users`.`del_flg` AS `user.del_flg`, `users`.`created_at` AS `user.created_at` "+
-		"FROM `posts` LEFT JOIN `users` ON `users`.`id` = `posts`.`user_id` WHERE `users`.`del_flg` = 0 ORDER BY `posts`.`created_at` DESC LIMIT ? ), "+
-		"pc AS ( SELECT "+
-		"pu.*, "+
-		"`comments`.`id` AS `comment.id`, `comments`.`user_id` AS `comment.user_id`, `comments`.`comment` AS `comment.comment`, `comments`.`created_at` AS `comment.created_at`, "+
-		"`users`.`id` AS `comment.user.id`, `users`.`account_name` AS `comment.user.account_name`, `users`.`authority` AS `comment.user.authority`, `users`.`del_flg` AS `comment.user.del_flg`, `users`.`created_at` AS `comment.user.created_at`, "+
-		"ROW_NUMBER() OVER (PARTITION BY pu.id ORDER BY comments.created_at) AS rn, COUNT(*) OVER (PARTITION BY pu.id) AS comment_count "+
-		"FROM pu "+
-		"LEFT JOIN `comments` ON `comments`.`post_id` = `pu`.`id` "+
-		"LEFT JOIN `users` ON `users`.`id` = `comments`.`user_id` "+
-		"ORDER BY `comments`.`created_at` ) "+
-		"SELECT * FROM pc WHERE (rn <= 3 OR rn IS NULL)", postsPerPage)
+	posts, err := updateIndexPosts()
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r))
-	if err != nil {
-		log.Print(err)
-		return
+	for i := range posts {
+		posts[i].CSRFToken = getCSRFToken(r)
 	}
 
 	indexTemplate.Execute(w, struct {
