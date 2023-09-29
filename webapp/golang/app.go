@@ -26,6 +26,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
+	cmap "github.com/orcaman/concurrent-map/v2"
 )
 
 var (
@@ -189,10 +190,15 @@ func getSessionUser(r *http.Request) User {
 
 	u := User{}
 
+	if u, ok := userCache.Get(strconv.Itoa(uid.(int))); ok {
+		return u
+	}
+
 	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
 	if err != nil {
 		return User{}
 	}
+	userCache.Set(strconv.Itoa(u.ID), u)
 
 	return u
 }
@@ -278,9 +284,14 @@ func getTemplPath(filename string) string {
 	return path.Join("templates", filename)
 }
 
+var (
+	userCache = cmap.New[User]()
+)
+
 func getInitialize(w http.ResponseWriter, r *http.Request) {
 	dbInitialize()
 	deleteImageFiles()
+	userCache.Clear()
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -319,6 +330,7 @@ func postLogin(w http.ResponseWriter, r *http.Request) {
 		session.Values["csrf_token"] = secureRandomStr(16)
 		session.Save(r, w)
 
+		userCache.Set(strconv.Itoa(u.ID), *u)
 		http.Redirect(w, r, "/", http.StatusFound)
 	} else {
 		session := getSession(r)
@@ -392,7 +404,7 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 		return
 	}
-	session.Values["user_id"] = uid
+	session.Values["user_id"] = int(uid)
 	session.Values["csrf_token"] = secureRandomStr(16)
 	session.Save(r, w)
 
@@ -869,6 +881,7 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 
 	for _, id := range r.Form["uid[]"] {
 		db.Exec(query, 1, id)
+		userCache.Remove(id)
 	}
 
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
