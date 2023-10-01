@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	crand "crypto/rand"
 	"crypto/sha512"
 	"database/sql"
@@ -18,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	txtemplate "text/template"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -425,28 +427,35 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 var (
-	indexTemplate = template.Must(template.New("layout.html").Funcs(template.FuncMap{
+	indexTemplate = txtemplate.Must(txtemplate.New("layout.html").Funcs(txtemplate.FuncMap{
 		"imageURL": imageURL,
+		"escape":   txtemplate.HTMLEscapeString,
 	}).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("index.html"),
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
+		getTemplPath("index/layout.html"),
+	))
+
+	indexContentTemplate = txtemplate.Must(txtemplate.New("index.html").Funcs(txtemplate.FuncMap{
+		"imageURL": imageURL,
+		"escape":   txtemplate.HTMLEscapeString,
+	}).ParseFiles(
+		getTemplPath("index/index.html"),
+		getTemplPath("index/posts.html"),
+		getTemplPath("index/post.html"),
 	))
 )
 
 var (
-	indexPosts      = []Post{}
+	indexContent    = ""
 	indexPostsMutex = sync.RWMutex{}
 	lastUpdated     = time.Now()
 	lastTriggered   = time.Now()
 )
 
-func updateIndexPosts() ([]Post, error) {
+func updateIndexPosts() (string, error) {
 	indexPostsMutex.RLock()
 	if lastUpdated.After(lastTriggered) {
 		defer indexPostsMutex.RUnlock()
-		return indexPosts, nil
+		return indexContent, nil
 	}
 	indexPostsMutex.RUnlock()
 
@@ -478,7 +487,12 @@ func updateIndexPosts() ([]Post, error) {
 			return nil, err
 		}
 
-		indexPosts = posts
+		indexContentBuf := bytes.NewBuffer(nil)
+		indexContentTemplate.ExecuteTemplate(indexContentBuf, "index.html", struct {
+			Posts []Post
+		}{posts})
+
+		indexContent = indexContentBuf.String()
 		lastUpdated = time.Now()
 		return nil, nil
 	})
@@ -487,30 +501,31 @@ func updateIndexPosts() ([]Post, error) {
 	defer indexPostsMutex.RUnlock()
 
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	return indexPosts, nil
+	return indexContent, nil
 }
 
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
-	posts, err := updateIndexPosts()
+	indexContent, err := updateIndexPosts()
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	for i := range posts {
-		posts[i].CSRFToken = getCSRFToken(r)
+	indexContent = strings.Replace(indexContent, "<<CSRFToken>>", getCSRFToken(r), -1)
+	if flash := getFlash(w, r, "notice"); flash != "" {
+		indexContent = strings.Replace(indexContent, "##Flash##", `<div id="notice-message" class="alert alert-danger">`+flash+`</div>`, -1)
+	} else {
+		indexContent = strings.Replace(indexContent, "##Flash##", "", -1)
 	}
 
 	indexTemplate.Execute(w, struct {
-		Posts     []Post
-		Me        User
-		CSRFToken string
-		Flash     string
-	}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
+		Me      User
+		Content string
+	}{me, indexContent})
 }
 
 var (
